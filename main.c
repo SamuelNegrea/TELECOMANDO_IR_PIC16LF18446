@@ -39,7 +39,6 @@
 #define IR_BLANK_US             600u
 
 #define IR_REPEAT_PERIOD_MS     45u
-#define IR_MAX_HOLD_MS          10000u
 #define KEY_DEBOUNCE_MS         20u
 
 #define NO_KEY                  0xFFu
@@ -446,7 +445,7 @@ static void keypad_sleep_until_press(void)
     /* Tutte le righe basse */
     LATC = 0x00u;
 
-    /* Se un tasto è già premuto, non entra in Sleep */
+    /* Se un tasto Ã¨ giÃ  premuto, non entra in Sleep */
     if ((PORTB & 0xF0u) != 0xF0u)
     {
         LATC = 0xFFu;
@@ -487,7 +486,7 @@ static void keypad_sleep_until_press(void)
         return;
     }
 
-    /* Modalità Sleep */
+    /* ModalitÃ  Sleep */
     SLEEP();
     NOP();
 
@@ -508,7 +507,6 @@ static void keypad_sleep_until_press(void)
 static void process_key(uint8_t key)
 {
     uint16_t frame;
-    uint16_t elapsed_ms = 0u;
     uint8_t slice;
 
     frame = build_frame(SENDER_ID, key, STATUS_DEFAULT);
@@ -519,18 +517,18 @@ static void process_key(uint8_t key)
     ir_transmit_frame(frame);
 
     /*
-     * Ripetizione durante la pressione.
-     * Attesa di 45 ms dopo ogni frame.
+     * Ripete il telegramma senza un limite massimo di tempo.
+     * La trasmissione continua finchÃ© il tasto resta premuto.
+     * Il rilascio viene verificato ogni 5 ms e confermato
+     * dopo KEY_DEBOUNCE_MS per evitare falsi rilasci.
      */
-    while (elapsed_ms < IR_MAX_HOLD_MS)
+    while (1)
     {
         for (slice = 0u;
              slice < IR_REPEAT_PERIOD_MS;
              slice += 5u)
         {
             __delay_ms(5);
-
-            elapsed_ms += 5u;
 
             /* Controlla che il pulsante sia ancora premuto */
             if (keypad_scan_raw() != key)
@@ -542,14 +540,9 @@ static void process_key(uint8_t key)
                     return;
                 }
             }
-
-            if (elapsed_ms >= IR_MAX_HOLD_MS)
-            {
-                return;
-            }
         }
 
-        /* Trasmette un nuovo telegramma */
+        /* Trascorsi 45 ms, trasmette un nuovo telegramma */
         ir_transmit_frame(frame);
     }
 }
