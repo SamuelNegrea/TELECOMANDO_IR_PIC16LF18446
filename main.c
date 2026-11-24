@@ -2,85 +2,129 @@
  * TELECOMANDO_IR - PIC16LF18446
  * MPLAB X + XC8
  *
- * PROTOTIPO NON VALIDATO SU HARDWARE.
+ * CLOCK:
+ * - HFINTOSC 32 MHz
  *
- * Portante IR:
- * - PWM hardware PWM6
+ * USCITA IR:
+ * - PWM6 hardware
  * - Timer2
- * - Frequenza teorica: 36.364 kHz
- * - HIGH: 5,50 us
- * - Duty cycle: 20,00%
+ * - PWM6OUT assegnato a RA1 (DBG1 / ICSPCLK)
  *
- * GPIO temporanei:
- * - Righe tastiera: RC0..RC7
- * - Colonne tastiera: RB4..RB7
- * - LED IR: RA2 e RA4
+ * PORTANTE:
+ * - Periodo: 28.75 us
+ * - Frequenza: 34.783 kHz
+ * - HIGH: 5.75 us
+ * - Duty cycle: 20%
  *
- * I due LED ricevono lo stesso segnale PWM6.
+ * PROTOCOLLO:
+ * - START: 69 cicli
+ * - BIT 0: 22 cicli
+ * - BIT 1: 44 cicli
+ * - BLANK: 600 us
+ * - Ripetizione: una trama ogni 500 ms (inizio-inizio)
+ *
+ * PULSANTE:
+ * - RA0, attivo LOW
+ *
+ * TASTIERA:
+ * - Righe RC0..RC7
+ * - Colonne RB4..RB7
+ *
+ * ATTENZIONE:
+ * RA1 e' condiviso con ICSPCLK/DBG1.
+ * Programmare il PIC e testare senza debugger attivo.
+ *
+ * PROTOTIPO: verificare temporizzazioni e uscita
+ * PWM con oscilloscopio prima del collegamento del LED.
  */
-
+#pragma config WDTE = OFF
 #include <xc.h>
 #include <stdint.h>
 #include <stdbool.h>
 
-#define _XTAL_FREQ              32000000UL
-
 /* =========================================================
-   PARAMETRI PROTOCOLLO
+   CONFIGURAZIONE GENERALE
    ========================================================= */
 
-#define SENDER_ID               1u
-#define STATUS_DEFAULT          0u
+#define _XTAL_FREQ                 32000000UL
 
-#define IR_START_CYCLES         68u
-#define IR_BIT0_CYCLES          22u
-#define IR_BIT1_CYCLES          44u
-
-#define IR_BLANK_US             600u
-
-#define IR_REPEAT_PERIOD_MS     45u
-#define KEY_DEBOUNCE_MS         20u
-
-#define NO_KEY                  0xFFu
-#define KEY_COUNT               32u
+#define ENABLE_BUTTON_SCOPE_TEST  1u
 
 /* =========================================================
-   PARAMETRI PWM HARDWARE
+   PARAMETRI PROTOCOLLO IR
+   ========================================================= */
+
+#define SENDER_ID                  1u
+#define STATUS_DEFAULT             0u
+
+#define IR_START_CYCLES            69u
+#define IR_BIT0_CYCLES             22u
+#define IR_BIT1_CYCLES             44u
+
+#define IR_BLANK_US                600u
+
+#define KEY_DEBOUNCE_MS            20u
+
+#define NO_KEY                     0xFFu
+#define KEY_COUNT                  32u
+
+#define MIN_FRAMES_PER_PRESS       5u
+
+#define TEST_FRAME  0xCAA9u
+
+/* =========================================================
+   PARAMETRI PWM6 / TIMER2
    ========================================================= */
 
 /*
  * Fosc = 32 MHz
+ * Fosc/4 = 8 MHz
+ * Tick Timer2 = 125 ns
  *
- * Periodo PWM:
- * T = (T2PR + 1) * 4 / Fosc
+ * T2PR = 229
  *
- * T2PR = 219:
- * T = 220 * 4 / 32.000.000
- * T = 27,50 us
+ * Periodo:
+ * (229 + 1) / 8 MHz = 28.75 us
  *
- * Frequenza = 36.364 kHz
- */
-
-#define IR_PWM_PR2              219u
-
-/*
- * PWMDC = 176
+ * Frequenza:
+ * 1 / 28.75 us = 34.7826 kHz
  *
- * Impulso HIGH:
- * 176 / 32 MHz = 5,50 us
+ * Risoluzione PWM:
+ * 4 * (T2PR + 1) = 920 conteggi
  *
  * Duty:
- * 176 / (4 * 220) = 20,00%
+ * 184 / 920 = 20%
+ *
+ * HIGH:
+ * 184 * 31.25 ns = 5.75 us
  */
 
-#define IR_PWM_DUTY_COUNTS      176u
+#define IR_PWM_PR2                 229u
+#define IR_PWM_DUTY_COUNTS         184u
 
 /*
- * Timer2 incrementa ogni 0,125 us.
- * PWMDC 176 corrisponde a 44 conteggi Timer2.
+ * Timer2:
+ * 1 conteggio = 125 ns
+ *
+ * 46 conteggi = 5.75 us
  */
 
-#define IR_PWM_END_TMR2_COUNT   44u
+#define IR_PWM_END_TMR2_COUNT      46u
+
+/* =========================================================
+   TIMER0 - PERIODO DI RIPETIZIONE (500 ms)
+   ========================================================= */
+
+/*
+ * Fosc/4 = 8 MHz
+ * Prescaler 1:64 = 125 kHz (8 us per conteggio)
+ *
+ * 500 ms = 62500 conteggi
+ *
+ * 65536 - 62500 = 3036 = 0x0BDC
+ */
+
+#define TMR0_PRELOAD               0x0BDCu
 
 /* =========================================================
    VARIABILI DEBUG
@@ -88,61 +132,101 @@
 
 volatile uint16_t debug_last_frame = 0u;
 volatile uint16_t debug_tx_count = 0u;
+
 volatile uint8_t debug_last_key = NO_KEY;
 volatile uint8_t debug_last_crc = 0u;
 
 /* =========================================================
-   CLOCK
+   INIZIALIZZAZIONE CLOCK
    ========================================================= */
 
 static void clock_init(void)
 {
     /*
-     * NOSC = 110: HFINTOSC
-     * NDIV = 0000: divisore 1:1
+     * NOSC = HFINTOSC
+     * NDIV = 1:1
      */
+
     OSCCON1 = 0x60u;
 
     /*
-     * HFFRQ = 0111: HFINTOSC 32 MHz
+     * HFINTOSC = 32 MHz
      */
+
     OSCFRQ = 0x07u;
 
     __delay_ms(1);
 }
 
 /* =========================================================
-   GPIO
+   INIZIALIZZAZIONE GPIO
    ========================================================= */
 
 static void gpio_init(void)
 {
-    /* Tutti i pin utilizzati come digitali */
+    /*
+     * Tutti i pin utilizzati come digitali
+     */
+
     ANSELA = 0x00u;
     ANSELB = 0x00u;
     ANSELC = 0x00u;
 
     /*
-     * RA2 e RA4 saranno pilotati dal PWM.
-     * Li lasciamo inizialmente come ingressi.
+     * RA0 = pulsante esterno
      */
+
+#if ENABLE_BUTTON_SCOPE_TEST
+
+    TRISAbits.TRISA0 = 1;
+
+    /*
+     * Pull-up interna RA0
+     */
+
+    WPUAbits.WPUA0 = 1;
+
+#endif
+
+    /*
+     * RA1 = uscita PWM6
+     * La configurazione PPS viene effettuata in ir_pwm_init().
+     */
+
+    TRISAbits.TRISA1 = 0;
+    LATAbits.LATA1 = 0;
+
+    /*
+     * RA2 e RA4 non utilizzati per il PWM
+     */
+
     TRISAbits.TRISA2 = 1;
     TRISAbits.TRISA4 = 1;
 
-    LATAbits.LATA2 = 0;
-    LATAbits.LATA4 = 0;
+    /*
+     * Tastiera:
+     * RC0..RC7 = uscite
+     */
 
-    /* Righe tastiera RC0..RC7 */
     TRISC = 0x00u;
     LATC = 0xFFu;
 
-    /* Colonne tastiera RB4..RB7 */
+    /*
+     * RB4..RB7 = ingressi
+     */
+
     TRISB = 0xF0u;
 
-    /* Pull-up interne sulle colonne */
+    /*
+     * Pull-up sulle colonne RB4..RB7
+     */
+
     WPUB = 0xF0u;
 
-    /* IOC inizialmente disabilitato */
+    /*
+     * IOC inizialmente disabilitato
+     */
+
     IOCBP = 0x00u;
     IOCBN = 0x00u;
     IOCBF = 0x00u;
@@ -156,33 +240,109 @@ static void gpio_init(void)
 
 static void ir_pwm_init(void)
 {
+    /*
+     * Disabilita PWM6
+     */
+
     PWM6CONbits.EN = 0;
+
+    /*
+     * Polarita' normale
+     */
+
     PWM6CONbits.POL = 0;
+
+    /*
+     * Timer2 spento durante la configurazione
+     */
+
     T2CON = 0x00u;
-    CCPTMRS1bits.P6TSEL = 0b01; /* PWM6 usa Timer2 */
-    T2CLKCON = 0x01u;           /* Clock = Fosc/4 */
-    T2HLT = 0x00u;              /* Free-running, software gate */
+
+    /*
+     * PWM6 utilizza Timer2.
+     * P6TSEL = 01
+     */
+
+    CCPTMRS1bits.P6TSEL = 0b01;
+
+    /*
+     * Clock Timer2 = Fosc/4
+     */
+
+    T2CLKCON = 0x01u;
+
+    /*
+     * Modalita' Free Running
+     */
+
+    T2HLT = 0x00u;
+
+    /*
+     * Nessuna sorgente esterna di reset
+     */
+
     T2RST = 0x00u;
+
+    /*
+     * Periodo PWM
+     */
+
     T2PR = IR_PWM_PR2;
-    PWM6DCH = (uint8_t)(IR_PWM_DUTY_COUNTS >> 2);
-    PWM6DCL = (uint8_t)((IR_PWM_DUTY_COUNTS & 0x03u) << 6);
+
+    /*
+     * Duty PWM a 10 bit
+     */
+
+    PWM6DCH =
+        (uint8_t)(IR_PWM_DUTY_COUNTS >> 2);
+
+    PWM6DCL =
+        (uint8_t)((IR_PWM_DUTY_COUNTS & 0x03u) << 6);
+
+    /*
+     * Contatore iniziale
+     */
+
     T2TMR = 0u;
 
-    /* PWM6OUT = 0x0D su RA2 e RA4 tramite PPS */
+    /*
+     * Configurazione PPS:
+     * PWM6OUT -> RA1
+     *
+     * 0x0D = PWM6OUT
+     */
+
     INTCONbits.GIE = 0;
+
     PPSLOCK = 0x55u;
     PPSLOCK = 0xAAu;
+
     PPSLOCKbits.PPSLOCKED = 0;
-    RA2PPS = 0x0Du;
-    RA4PPS = 0x0Du;
+
+    RA1PPS = 0x0Du;
+
     PPSLOCK = 0x55u;
     PPSLOCK = 0xAAu;
+
     PPSLOCKbits.PPSLOCKED = 1;
 
-    TRISAbits.TRISA2 = 0;
-    TRISAbits.TRISA4 = 0;
-    LATAbits.LATA2 = 0;
-    LATAbits.LATA4 = 0;
+    /*
+     * RA1 come uscita
+     */
+
+    TRISAbits.TRISA1 = 0;
+
+    /*
+     * Latch iniziale LOW
+     */
+
+    LATAbits.LATA1 = 0;
+
+    /*
+     * PWM6 e Timer2 rimangono spenti.
+     * Verranno attivati durante i burst.
+     */
+
     PWM6CONbits.EN = 0;
     T2CONbits.ON = 0;
 }
@@ -203,7 +363,7 @@ static uint8_t crc4_calculate(uint16_t payload12)
     for (bit_index = 0u; bit_index < 12u; bit_index++)
     {
         feedback = (uint8_t)
-                   ((crc ^ (payload12 >> bit_index)) & 0x01u);
+            ((crc ^ (payload12 >> bit_index)) & 0x01u);
 
         crc >>= 1;
 
@@ -226,16 +386,28 @@ static uint16_t build_payload(uint8_t sender,
 {
     uint16_t payload = 0u;
 
-    /* Sender: 3 bit */
+    /*
+     * Sender: 3 bit
+     * Bit 0..2
+     */
+
     payload |= (uint16_t)(sender & 0x07u);
 
-    /* Command: 6 bit */
-    payload |= (uint16_t)
-               ((uint16_t)(command & 0x3Fu) << 3);
+    /*
+     * Command: 6 bit
+     * Bit 3..8
+     */
 
-    /* Status: 3 bit */
     payload |= (uint16_t)
-               ((uint16_t)(status & 0x07u) << 9);
+        ((uint16_t)(command & 0x3Fu) << 3);
+
+    /*
+     * Status: 3 bit
+     * Bit 9..11
+     */
+
+    payload |= (uint16_t)
+        ((uint16_t)(status & 0x07u) << 9);
 
     return payload;
 }
@@ -257,36 +429,137 @@ static uint16_t build_frame(uint8_t sender,
 
     debug_last_crc = crc;
 
+    /*
+     * CRC nei bit 12..15
+     */
+
     return (uint16_t)
-           (payload | ((uint16_t)crc << 12));
+        (payload | ((uint16_t)crc << 12));
 }
 
 /* =========================================================
    GENERAZIONE BURST PWM
    ========================================================= */
 
+/*
+ * Genera un burst di N periodi PWM.
+ *
+ * Il flag TMR2IF segnala il match tra T2TMR e T2PR.
+ *
+ * La funzione:
+ * 1. Azzera Timer2.
+ * 2. Avvia PWM6 e Timer2.
+ * 3. Conta N-1 periodi completi.
+ * 4. Attende la fine della parte HIGH dell'ultimo periodo.
+ * 5. Disabilita PWM6 e Timer2.
+ *
+ * La durata reale e il bordo di spegnimento devono essere
+ * verificati con l'oscilloscopio.
+ */
+
 static void ir_carrier_burst(uint8_t cycles)
 {
     uint8_t i;
-    if (cycles == 0u) return;
+
+    if (cycles == 0u)
+    {
+        return;
+    }
+
+    /*
+     * Ferma PWM6 e Timer2
+     */
 
     PWM6CONbits.EN = 0;
     T2CONbits.ON = 0;
-    T2TMR = 0u;
-    PWM6CONbits.EN = 1;
-    T2CON = 0x80u; /* Timer2 ON, prescaler/postscaler 1:1 */
 
-    for (i = 0u; i < cycles; i++)
+    /*
+     * Azzera Timer2
+     */
+
+    T2TMR = 0u;
+
+    /*
+     * Cancella il flag Timer2
+     */
+
+    PIR4bits.TMR2IF = 0;
+
+    /*
+     * Abilita PWM6
+     */
+
+    PWM6CONbits.EN = 1;
+
+    /*
+     * Avvia Timer2
+     */
+
+    T2CONbits.ON = 1;
+
+    /*
+     * Attende N-1 periodi completi.
+     */
+
+    for (i = 1u; i < cycles; i++)
     {
-        while (T2TMR < IR_PWM_END_TMR2_COUNT) { ; }
-        if ((uint8_t)(i + 1u) < cycles)
+        /*
+         * Attende il match TMR2 = PR2
+         */
+
+        while (PIR4bits.TMR2IF == 0)
         {
-            while (T2TMR >= IR_PWM_END_TMR2_COUNT) { ; }
+            ;
+        }
+
+        /*
+         * Cancella il flag
+         */
+
+        PIR4bits.TMR2IF = 0;
+
+        /*
+         * Attende il riavvio del contatore.
+         */
+
+        while (T2TMR >= IR_PWM_PR2)
+        {
+            ;
         }
     }
 
+    /*
+     * Attende la fine della parte HIGH
+     * dell'ultimo periodo.
+     *
+     * 46 conteggi * 125 ns = 5.75 us
+     */
+
+    while (T2TMR < IR_PWM_END_TMR2_COUNT)
+    {
+        ;
+    }
+
+    /*
+     * Ferma il PWM.
+     * Il latch di RA1 e' mantenuto LOW.
+     */
+
     PWM6CONbits.EN = 0;
+
+    LATAbits.LATA1 = 0;
+
+    /*
+     * Ferma Timer2
+     */
+
     T2CONbits.ON = 0;
+
+    /*
+     * Cancella il flag
+     */
+
+    PIR4bits.TMR2IF = 0;
 }
 
 /* =========================================================
@@ -295,16 +568,30 @@ static void ir_carrier_burst(uint8_t cycles)
 
 static void ir_send_bit(uint8_t bit_value)
 {
-    if (bit_value != 0u)
+    if (bit_value == 0u)
     {
-        ir_carrier_burst(IR_BIT1_CYCLES);
+        /*
+         * BIT 0:
+         * 22 periodi PWM
+         */
+
+        ir_carrier_burst(IR_BIT0_CYCLES);
     }
     else
     {
-        ir_carrier_burst(IR_BIT0_CYCLES);
+        /*
+         * BIT 1:
+         * 44 periodi PWM
+         */
+
+        ir_carrier_burst(IR_BIT1_CYCLES);
     }
 
-    /* Pausa tra i bit */
+    /*
+     * Blank tra i bit:
+     * 600 us senza portante
+     */
+
     __delay_us(IR_BLANK_US);
 }
 
@@ -316,19 +603,30 @@ static void ir_transmit_frame(uint16_t frame)
 {
     uint8_t bit_index;
 
-    /* Start burst */
+    /*
+     * START:
+     * 69 periodi PWM
+     */
+
     ir_carrier_burst(IR_START_CYCLES);
+
+    /*
+     * Blank dopo START
+     */
 
     __delay_us(IR_BLANK_US);
 
-    /* Trasmissione dei 16 bit LSB-first */
+    /*
+     * Trasmissione dei 16 bit LSB-first
+     */
+
     for (bit_index = 0u; bit_index < 16u; bit_index++)
     {
-        ir_send_bit((uint8_t)
-                    ((frame >> bit_index) & 0x01u));
+        ir_send_bit(
+            (uint8_t)((frame >> bit_index) & 0x01u)
+        );
     }
 
-    /* Aggiornamento debug */
     debug_last_frame = frame;
     debug_tx_count++;
 }
@@ -343,25 +641,37 @@ static uint8_t keypad_scan_raw(void)
     uint8_t columns;
     uint8_t col;
 
-    /* Disabilita IOC durante la scansione */
+    /*
+     * Disabilita IOC durante la scansione
+     */
+
     PIE0bits.IOCIE = 0;
 
     IOCBN = 0x00u;
     IOCBP = 0x00u;
 
-    /* Cancella i flag IOC */
     IOCBF = 0x00u;
 
     for (row = 0u; row < 8u; row++)
     {
+        /*
+         * Tutte le righe HIGH
+         */
+
         LATC = 0xFFu;
 
-        /* Porta bassa la riga selezionata */
+        /*
+         * Porta LOW la riga selezionata
+         */
+
         LATC &= (uint8_t)~(1u << row);
 
         __delay_us(50);
 
-        /* Legge RB4..RB7 */
+        /*
+         * Legge RB4..RB7
+         */
+
         columns = (uint8_t)((PORTB >> 4) & 0x0Fu);
 
         if (columns != 0x0Fu)
@@ -384,17 +694,21 @@ static uint8_t keypad_scan_raw(void)
 }
 
 /* =========================================================
-   DEBOUNCE PRESSIONE
+   DEBOUNCE PRESSIONE TASTIERA
    ========================================================= */
 
 static uint8_t keypad_read_debounced(void)
 {
     uint8_t first;
     uint8_t second;
+    uint8_t i;
 
     first = keypad_scan_raw();
 
-    __delay_ms(KEY_DEBOUNCE_MS);
+    for (i = 0u; i < KEY_DEBOUNCE_MS; i++)
+    {
+        __delay_ms(1);
+    }
 
     second = keypad_scan_raw();
 
@@ -407,7 +721,7 @@ static uint8_t keypad_read_debounced(void)
 }
 
 /* =========================================================
-   ATTESA RILASCIO STABILE
+   ATTESA RILASCIO TASTIERA
    ========================================================= */
 
 static void keypad_wait_release(void)
@@ -437,113 +751,154 @@ static void keypad_wait_release(void)
 }
 
 /* =========================================================
-   SLEEP E RISVEGLIO TRAMITE IOC
+   TIMER0 - PERIODO DI RIPETIZIONE 500 ms
    ========================================================= */
 
-static void keypad_sleep_until_press(void)
+static void timer0_init(void)
 {
-    /* Tutte le righe basse */
-    LATC = 0x00u;
-
-    /* Se un tasto Ã¨ giÃ  premuto, non entra in Sleep */
-    if ((PORTB & 0xF0u) != 0xF0u)
-    {
-        LATC = 0xFFu;
-        return;
-    }
-
-    /* Disabilita i fronti positivi */
-    IOCBP = 0x00u;
-
-    /* Abilita i fronti negativi RB4..RB7 */
-    IOCBN = 0xF0u;
-
-    /* Cancella i vecchi flag */
-    IOCBF = 0x00u;
-
-    /* Abilita IOC */
-    PIE0bits.IOCIE = 1;
-
-    /* Abilita interrupt periferici */
-    INTCONbits.PEIE = 1;
+    T0CON0bits.T0EN = 0;
 
     /*
-     * GIE disabilitato:
-     * il PIC si risveglia senza entrare in una ISR.
+     * Clock: Fosc/4 = 8 MHz
+     * Prescaler: 1:64
+     * Timer0: 125 kHz
      */
-    INTCONbits.GIE = 0;
+    T0CON1 = 0x46u;
 
-    /* Secondo controllo prima dello Sleep */
-    if ((PORTB & 0xF0u) != 0xF0u)
+    /* Modalita' 16 bit, postscaler 1:1 */
+    T0CON0 = 0x10u;
+
+    TMR0H = (uint8_t)(TMR0_PRELOAD >> 8);
+    TMR0L = (uint8_t)TMR0_PRELOAD;
+
+    PIR0bits.TMR0IF = 0;
+}
+
+static void timer0_start_period(void)
+{
+    T0CON0bits.T0EN = 0;
+
+    TMR0H = (uint8_t)(TMR0_PRELOAD >> 8);
+    TMR0L = (uint8_t)TMR0_PRELOAD;
+
+    PIR0bits.TMR0IF = 0;
+
+    T0CON0bits.T0EN = 1;
+}
+
+/*
+ * Attende l'overflow (500 ms dall'avvio) e ferma il timer.
+ * Dopo il ritorno sono trascorsi ALMENO 500 ms dall'inizio
+ * dell'ultima trama.
+ */
+static void timer0_wait_period(void)
+{
+    while (PIR0bits.TMR0IF == 0)
     {
-        PIE0bits.IOCIE = 0;
-
-        IOCBN = 0x00u;
-        IOCBF = 0x00u;
-
-        LATC = 0xFFu;
-
-        return;
+        ;
     }
 
-    /* ModalitÃ  Sleep */
-    SLEEP();
-    NOP();
+    T0CON0bits.T0EN = 0;
 
-    /* Disabilita IOC dopo il risveglio */
-    PIE0bits.IOCIE = 0;
-
-    IOCBN = 0x00u;
-    IOCBF = 0x00u;
-
-    /* Ripristina le righe */
-    LATC = 0xFFu;
+    PIR0bits.TMR0IF = 0;
 }
 
 /* =========================================================
-   TRASMISSIONE DURANTE LA PRESSIONE
+   TRASMISSIONE DA PULSANTE ESTERNO RA0
+   ========================================================= */
+
+static void process_button_ir(void)
+{
+    while (1)
+    {
+        /* Avvia il timer prima della trasmissione */
+        timer0_start_period();
+
+        /* Trasmette una sola trama */
+        ir_transmit_frame(TEST_FRAME);
+
+        /* Attende 500 ms dall'inizio della trama */
+        timer0_wait_period();
+
+        /* Controlla se il pulsante e' stato rilasciato */
+        if (PORTAbits.RA0 != 0)
+        {
+            /* Attende la stabilizzazione del contatto */
+            __delay_ms(KEY_DEBOUNCE_MS);
+
+            /* Conferma il rilascio */
+            if (PORTAbits.RA0 != 0)
+            {
+                break;
+            }
+        }
+    }
+}
+
+/* =========================================================
+   TRASMISSIONE DA TASTIERA
    ========================================================= */
 
 static void process_key(uint8_t key)
 {
     uint16_t frame;
-    uint8_t slice;
+    uint8_t sent;
 
-    frame = build_frame(SENDER_ID, key, STATUS_DEFAULT);
+    /*
+     * Costruisce il frame
+     */
+
+    frame = build_frame(
+        SENDER_ID,
+        key,
+        STATUS_DEFAULT
+    );
 
     debug_last_key = key;
 
-    /* Primo telegramma immediato */
-    ir_transmit_frame(frame);
+    sent = 0u;
 
-    /*
-     * Ripete il telegramma senza un limite massimo di tempo.
-     * La trasmissione continua finchÃ© il tasto resta premuto.
-     * Il rilascio viene verificato ogni 5 ms e confermato
-     * dopo KEY_DEBOUNCE_MS per evitare falsi rilasci.
-     */
-    while (1)
+    for (;;)
     {
-        for (slice = 0u;
-             slice < IR_REPEAT_PERIOD_MS;
-             slice += 5u)
-        {
-            __delay_ms(5);
+        /*
+         * Timer0 parte subito prima della trama:
+         * il riferimento e' l'inizio della trasmissione.
+         */
 
-            /* Controlla che il pulsante sia ancora premuto */
+        timer0_start_period();
+
+        ir_transmit_frame(frame);
+
+        sent++;
+
+        /*
+         * Attende SEMPRE la fine dei 500 ms prima di
+         * qualsiasi decisione. Cosi' non esiste alcun
+         * percorso di uscita che permetta di ritrasmettere
+         * prima del tempo, nemmeno se il main richiama
+         * subito process_key().
+         */
+
+        timer0_wait_period();
+
+        /*
+         * Dopo almeno MIN_FRAMES_PER_PRESS trame controlla
+         * se il tasto e' stato rilasciato. Il controllo e'
+         * a fine periodo, quando le linee sono stabili.
+         */
+
+        if (sent >= MIN_FRAMES_PER_PRESS)
+        {
             if (keypad_scan_raw() != key)
             {
                 __delay_ms(KEY_DEBOUNCE_MS);
 
                 if (keypad_scan_raw() != key)
                 {
-                    return;
+                    break;
                 }
             }
         }
-
-        /* Trascorsi 45 ms, trasmette un nuovo telegramma */
-        ir_transmit_frame(frame);
     }
 }
 
@@ -555,19 +910,48 @@ void main(void)
 {
     uint8_t key;
 
+    /*
+     * Inizializzazione
+     */
+
     clock_init();
 
     gpio_init();
 
-    /* Inizializza PWM6 e instradamento PPS */
     ir_pwm_init();
+
+    timer0_init();
+
+    /*
+     * Ciclo principale
+     */
 
     while (1)
     {
-        /* Attesa pressione */
-        keypad_sleep_until_press();
+        /*
+         * PULSANTE ESTERNO RA0
+         */
 
-        /* Lettura con debounce */
+#if ENABLE_BUTTON_SCOPE_TEST
+
+        if (PORTAbits.RA0 == 0)
+        {
+            __delay_ms(KEY_DEBOUNCE_MS);
+
+            if (PORTAbits.RA0 == 0)
+            {
+                process_button_ir();
+
+                continue;
+            }
+        }
+
+#endif
+
+        /*
+         * TASTIERA 8 x 4
+         */
+
         key = keypad_read_debounced();
 
         if (key < KEY_COUNT)
@@ -575,7 +959,10 @@ void main(void)
             process_key(key);
         }
 
-        /* Attende rilascio stabile */
+        /*
+         * Attende il rilascio della tastiera
+         */
+
         keypad_wait_release();
 
         __delay_ms(30);
