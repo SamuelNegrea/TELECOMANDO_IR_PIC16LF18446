@@ -1,5 +1,5 @@
 /*
- * TELECOMANDO_IR - PIC16LF18446
+ * TELECOMANDO_IR - PIC16F18446 (Curiosity Nano)
  * MPLAB X + XC8
  *
  * CLOCK:
@@ -23,21 +23,37 @@
  * - BLANK: 600 us
  * - Ripetizione: una trama ogni 500 ms (inizio-inizio)
  *
- * PULSANTE:
- * - RA0, attivo LOW
+ * TASTIERA 8 righe x 4 colonne:
+ * - Righe (uscite): RC0, RC1, RC2, RC3, RC4, RC5, RC6, RC7
+ * - Colonne (ingressi con pull-up): RB4, RB5, RB6, RB7
+ * - Tasto = riga * 4 + colonna (colonna 0 = RB4 ... 3 = RB7)
  *
- * TASTIERA:
- * - Righe RC0..RC7
- * - Colonne RB4..RB7
+ * PULSANTE DI TEST:
+ * - RA0 (DBG0), attivo LOW, pull-up interna
+ *   (abilitato con ENABLE_BUTTON_SCOPE_TEST)
  *
- * ATTENZIONE:
- * RA1 e' condiviso con ICSPCLK/DBG1.
- * Programmare il PIC e testare senza debugger attivo.
+ * USCITA LED IR:
+ * - RA1 (DBG1) = PWM6
+ *
+ * PIN LIBERI:
+ * - RA4 (AN4) e RA5 (AN5): analogici, configurati come
+ *   ingressi analogici
+ * - RA2: libero (collegato a LED0 della scheda), ingresso
+ * - RA3: solo ingresso (MCLR)
+ *
+ * ATTENZIONE (Curiosity Nano):
+ * - RA1 e RA0 sono condivisi con ICSPCLK / ICSPDAT.
+ *   Programmare il PIC e testare senza debugger attivo.
+ * - RC2 (riga 2) e' collegato a SW0 della scheda: non
+ *   premerlo durante l'uso della tastiera.
+ * - RB4 e RB6 (colonne 0 e 2) sono collegati alla porta
+ *   seriale del debugger: eventuale traffico seriale
+ *   puo' simulare la pressione di un tasto.
  *
  * PROTOTIPO: verificare temporizzazioni e uscita
  * PWM con oscilloscopio prima del collegamento del LED.
  */
-#pragma config WDTE = OFF
+
 #include <xc.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -47,8 +63,6 @@
    ========================================================= */
 
 #define _XTAL_FREQ                 32000000UL
-
-#define ENABLE_BUTTON_SCOPE_TEST  1u
 
 /* =========================================================
    PARAMETRI PROTOCOLLO IR
@@ -70,7 +84,89 @@
 
 #define MIN_FRAMES_PER_PRESS       5u
 
-#define TEST_FRAME  0xCAA9u
+/* 1 = pulsante di test su RA0 attivo, 0 = escluso */
+#define ENABLE_BUTTON_SCOPE_TEST   1u
+
+/* Trama inviata dal pulsante di test RA0 */
+#define TEST_FRAME                 0xCAA9u
+
+/* =========================================================
+   TABELLA COMANDI: un messaggio diverso per ogni tasto
+   ========================================================= */
+
+/*
+ * Indice tasto = riga * 4 + colonna  (0..31)
+ *
+ * Il campo COMMAND del frame e' di 6 bit (0..63).
+ * I 32 codici usati sono tutti i valori a 6 bit con
+ * numero PARI di bit a 1: due comandi qualsiasi differiscono
+ * quindi in almeno 2 bit, e un errore su un solo bit non
+ * puo' trasformare un comando in un altro valido
+ * (protezione in piu' rispetto al CRC-4).
+ *
+ * Il codice 0x00 e' assegnato per ultimo (tasto 31).
+ */
+
+static const uint8_t key_command[KEY_COUNT] =
+{
+    /* Riga 0 */
+    0x03u,  /* tasto  0 */
+    0x05u,  /* tasto  1 */
+    0x06u,  /* tasto  2 */
+    0x09u,  /* tasto  3 */
+
+    /* Riga 1 */
+    0x0Au,  /* tasto  4 */
+    0x0Cu,  /* tasto  5 */
+    0x0Fu,  /* tasto  6 */
+    0x11u,  /* tasto  7 */
+
+    /* Riga 2 */
+    0x12u,  /* tasto  8 */
+    0x14u,  /* tasto  9 */
+    0x17u,  /* tasto 10 */
+    0x18u,  /* tasto 11 */
+
+    /* Riga 3 */
+    0x1Bu,  /* tasto 12 */
+    0x1Du,  /* tasto 13 */
+    0x1Eu,  /* tasto 14 */
+    0x21u,  /* tasto 15 */
+
+    /* Riga 4 */
+    0x22u,  /* tasto 16 */
+    0x24u,  /* tasto 17 */
+    0x27u,  /* tasto 18 */
+    0x28u,  /* tasto 19 */
+
+    /* Riga 5 */
+    0x2Bu,  /* tasto 20 */
+    0x2Du,  /* tasto 21 */
+    0x2Eu,  /* tasto 22 */
+    0x30u,  /* tasto 23 */
+
+    /* Riga 6 */
+    0x33u,  /* tasto 24 */
+    0x35u,  /* tasto 25 */
+    0x36u,  /* tasto 26 */
+    0x39u,  /* tasto 27 */
+
+    /* Riga 7 */
+    0x3Au,  /* tasto 28 */
+    0x3Cu,  /* tasto 29 */
+    0x3Fu,  /* tasto 30 */
+    0x00u   /* tasto 31 */
+};
+
+/* =========================================================
+   MASCHERE PIN TASTIERA
+   ========================================================= */
+
+/* Righe: RC0..RC7 (PORTC) */
+#define ROWS_MASK_C                0xFFu
+
+/* Colonne: RB4..RB7 (PORTB) */
+#define COLS_MASK_B                0xF0u
 
 /* =========================================================
    PARAMETRI PWM6 / TIMER2
@@ -134,6 +230,7 @@ volatile uint16_t debug_last_frame = 0u;
 volatile uint16_t debug_tx_count = 0u;
 
 volatile uint8_t debug_last_key = NO_KEY;
+volatile uint8_t debug_last_command = 0u;
 volatile uint8_t debug_last_crc = 0u;
 
 /* =========================================================
@@ -165,71 +262,77 @@ static void clock_init(void)
 static void gpio_init(void)
 {
     /*
-     * Tutti i pin utilizzati come digitali
+     * Modalita' analogica / digitale
+     *
+     * PORTA: RA4 e RA5 analogici (AN4, AN5),
+     *        gli altri digitali
+     * PORTB, PORTC: tutti digitali
      */
 
-    ANSELA = 0x00u;
+    ANSELA = 0x30u;
     ANSELB = 0x00u;
     ANSELC = 0x00u;
 
     /*
-     * RA0 = pulsante esterno
+     * Livelli iniziali:
+     * - righe tutte HIGH (inattive)
+     * - RA1 (PWM) LOW
      */
 
-#if ENABLE_BUTTON_SCOPE_TEST
-
-    TRISAbits.TRISA0 = 1;
+    LATA = 0x00u;
+    LATB = 0x00u;
+    LATC = ROWS_MASK_C;
 
     /*
-     * Pull-up interna RA0
+     * PORTA:
+     * RA0 = ingresso (pulsante di test, pull-up)
+     * RA1 = uscita (PWM6 -> LED IR)
+     * RA2 = ingresso (libero)
+     * RA3 = ingresso (MCLR)
+     * RA4 = ingresso analogico
+     * RA5 = ingresso analogico
      */
 
-    WPUAbits.WPUA0 = 1;
-
-#endif
+    TRISA = 0x3Du;
 
     /*
-     * RA1 = uscita PWM6
-     * La configurazione PPS viene effettuata in ir_pwm_init().
+     * PORTB:
+     * RB4..RB7 = ingressi (colonne)
      */
 
-    TRISAbits.TRISA1 = 0;
-    LATAbits.LATA1 = 0;
+    TRISB = COLS_MASK_B;
 
     /*
-     * RA2 e RA4 non utilizzati per il PWM
-     */
-
-    TRISAbits.TRISA2 = 1;
-    TRISAbits.TRISA4 = 1;
-
-    /*
-     * Tastiera:
-     * RC0..RC7 = uscite
+     * PORTC:
+     * RC0..RC7 = uscite (righe)
      */
 
     TRISC = 0x00u;
-    LATC = 0xFFu;
-
-    /*
-     * RB4..RB7 = ingressi
-     */
-
-    TRISB = 0xF0u;
 
     /*
      * Pull-up sulle colonne RB4..RB7
+     * e sul pulsante di test RA0
      */
 
-    WPUB = 0xF0u;
+    WPUA = 0x01u;
+    WPUB = COLS_MASK_B;
+    WPUC = 0x00u;
 
     /*
-     * IOC inizialmente disabilitato
+     * IOC disabilitato
      */
+
+    IOCAP = 0x00u;
+    IOCAN = 0x00u;
+    IOCAF = 0x00u;
 
     IOCBP = 0x00u;
     IOCBN = 0x00u;
     IOCBF = 0x00u;
+
+    IOCCP = 0x00u;
+    IOCCN = 0x00u;
+    IOCCF = 0x00u;
 
     PIE0bits.IOCIE = 0;
 }
@@ -632,6 +735,27 @@ static void ir_transmit_frame(uint16_t frame)
 }
 
 /* =========================================================
+   TASTIERA 8 righe x 4 colonne - GESTIONE RIGHE
+   ========================================================= */
+
+/*
+ * Porta HIGH tutte le righe (inattive).
+ */
+static void keypad_rows_all_high(void)
+{
+    LATC = ROWS_MASK_C;
+}
+
+/*
+ * Porta LOW la riga selezionata (0..7 = RC0..RC7).
+ * Va chiamata dopo keypad_rows_all_high().
+ */
+static void keypad_row_select(uint8_t row)
+{
+    LATC &= (uint8_t)~(1u << row);
+}
+
+/* =========================================================
    SCANSIONE TASTIERA 8 x 4
    ========================================================= */
 
@@ -641,30 +765,14 @@ static uint8_t keypad_scan_raw(void)
     uint8_t columns;
     uint8_t col;
 
-    /*
-     * Disabilita IOC durante la scansione
-     */
-
-    PIE0bits.IOCIE = 0;
-
-    IOCBN = 0x00u;
-    IOCBP = 0x00u;
-
-    IOCBF = 0x00u;
-
     for (row = 0u; row < 8u; row++)
     {
         /*
-         * Tutte le righe HIGH
+         * Tutte le righe HIGH, poi LOW quella selezionata
          */
 
-        LATC = 0xFFu;
-
-        /*
-         * Porta LOW la riga selezionata
-         */
-
-        LATC &= (uint8_t)~(1u << row);
+        keypad_rows_all_high();
+        keypad_row_select(row);
 
         __delay_us(50);
 
@@ -680,7 +788,7 @@ static uint8_t keypad_scan_raw(void)
             {
                 if ((columns & (uint8_t)(1u << col)) == 0u)
                 {
-                    LATC = 0xFFu;
+                    keypad_rows_all_high();
 
                     return (uint8_t)(row * 4u + col);
                 }
@@ -688,7 +796,7 @@ static uint8_t keypad_scan_raw(void)
         }
     }
 
-    LATC = 0xFFu;
+    keypad_rows_all_high();
 
     return NO_KEY;
 }
@@ -804,8 +912,10 @@ static void timer0_wait_period(void)
 }
 
 /* =========================================================
-   TRASMISSIONE DA PULSANTE ESTERNO RA0
+   TRASMISSIONE DA PULSANTE DI TEST RA0
    ========================================================= */
+
+#if ENABLE_BUTTON_SCOPE_TEST
 
 static void process_button_ir(void)
 {
@@ -835,6 +945,8 @@ static void process_button_ir(void)
     }
 }
 
+#endif
+
 /* =========================================================
    TRASMISSIONE DA TASTIERA
    ========================================================= */
@@ -842,7 +954,14 @@ static void process_button_ir(void)
 static void process_key(uint8_t key)
 {
     uint16_t frame;
+    uint8_t command;
     uint8_t sent;
+
+    /*
+     * Messaggio associato al tasto
+     */
+
+    command = key_command[key];
 
     /*
      * Costruisce il frame
@@ -850,11 +969,12 @@ static void process_key(uint8_t key)
 
     frame = build_frame(
         SENDER_ID,
-        key,
+        command,
         STATUS_DEFAULT
     );
 
     debug_last_key = key;
+    debug_last_command = command;
 
     sent = 0u;
 
@@ -873,18 +993,15 @@ static void process_key(uint8_t key)
 
         /*
          * Attende SEMPRE la fine dei 500 ms prima di
-         * qualsiasi decisione. Cosi' non esiste alcun
-         * percorso di uscita che permetta di ritrasmettere
-         * prima del tempo, nemmeno se il main richiama
-         * subito process_key().
+         * qualsiasi decisione: nessun percorso di uscita
+         * permette di ritrasmettere prima del tempo.
          */
 
         timer0_wait_period();
 
         /*
          * Dopo almeno MIN_FRAMES_PER_PRESS trame controlla
-         * se il tasto e' stato rilasciato. Il controllo e'
-         * a fine periodo, quando le linee sono stabili.
+         * se il tasto e' stato rilasciato, a fine periodo.
          */
 
         if (sent >= MIN_FRAMES_PER_PRESS)
@@ -929,7 +1046,7 @@ void main(void)
     while (1)
     {
         /*
-         * PULSANTE ESTERNO RA0
+         * PULSANTE DI TEST RA0
          */
 
 #if ENABLE_BUTTON_SCOPE_TEST
